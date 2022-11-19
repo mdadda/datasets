@@ -12,17 +12,24 @@ import fsspec
 import numpy as np
 from huggingface_hub import HfApi
 
+from datasets.utils.metadata import DatasetMetadata
+
 from . import config
 from .arrow_dataset import Dataset
+from .download import DownloadConfig
 from .features import Features
 from .features.features import FeatureType
 from .filesystems import extract_path_from_uri, is_remote_filesystem
-from .info import DatasetInfo
+from .info import DatasetInfo, DatasetInfosDict
+from .naming import _split_re
 from .splits import NamedSplit, Split, SplitDict, SplitInfo
 from .table import Table
 from .tasks import TaskTemplate
 from .utils import logging
+from .utils._hf_hub_fixes import list_repo_files as hf_api_list_repo_files
 from .utils.doc_utils import is_documented_by
+from .utils.file_utils import cached_path
+from .utils.hub import hf_hub_url
 from .utils.typing import PathLike
 
 
@@ -35,14 +42,22 @@ class DatasetDict(dict):
     def _check_values_type(self):
         for dataset in self.values():
             if not isinstance(dataset, Dataset):
-                raise TypeError(f"Values in `DatasetDict` should of type `Dataset` but got type '{type(dataset)}'")
+                raise TypeError(f"Values in `DatasetDict` should be of type `Dataset` but got type '{type(dataset)}'")
+
+    def _check_values_features(self):
+        items = list(self.items())
+        for item_a, item_b in zip(items[:-1], items[1:]):
+            if item_a[1].features != item_b[1].features:
+                raise ValueError(
+                    f"All datasets in `DatasetDict` should have the same features but features for '{item_a[0]}' and '{item_b[0]}' don't match: {item_a[1].features} != {item_b[1].features}"
+                )
 
     def __getitem__(self, k) -> Dataset:
         if isinstance(k, (str, NamedSplit)) or len(self) == 0:
             return super().__getitem__(k)
         else:
             available_suggested_splits = [
-                str(split) for split in (Split.TRAIN, Split.TEST, Split.VALIDATION) if split in self
+                split for split in (Split.TRAIN, Split.TEST, Split.VALIDATION) if split in self
             ]
             suggested_split = available_suggested_splits[0] if available_suggested_splits else list(self)[0]
             raise KeyError(
@@ -457,7 +472,7 @@ class DatasetDict(dict):
             columns (:obj:`List[str]`, optional): columns to format in the output
                 None means ``__getitem__`` returns all columns (default)
             output_all_columns (:obj:`bool`, default to False): keep un-formatted columns as well in the output (as python objects)
-            format_kwargs: keywords arguments passed to the convert function like `np.array`, `torch.tensor` or `tensorflow.ragged.constant`.
+            **format_kwargs (additional keyword arguments): keywords arguments passed to the convert function like `np.array`, `torch.tensor` or `tensorflow.ragged.constant`.
         """
         self._check_values_type()
         old_format_type = {k: dataset._format_type for k, dataset in self.items()}
@@ -489,7 +504,7 @@ class DatasetDict(dict):
             columns (:obj:`List[str]`, optional): columns to format in the output.
                 None means ``__getitem__`` returns all columns (default).
             output_all_columns (:obj:`bool`, default to False): keep un-formatted columns as well in the output (as python objects)
-            format_kwargs: keywords arguments passed to the convert function like `np.array`, `torch.tensor` or `tensorflow.ragged.constant`.
+            **format_kwargs (additional keyword arguments): keywords arguments passed to the convert function like `np.array`, `torch.tensor` or `tensorflow.ragged.constant`.
 
         It is possible to call ``map`` after calling ``set_format``. Since ``map`` may add new columns, then the list of formatted columns
         gets updated. In this case, if you apply ``map`` on a dataset to add a new column, then this column will be formatted:
@@ -593,7 +608,7 @@ class DatasetDict(dict):
             columns (:obj:`List[str]`, optional): columns to format in the output
                 None means ``__getitem__`` returns all columns (default)
             output_all_columns (:obj:`bool`, default to False): keep un-formatted columns as well in the output (as python objects)
-            format_kwargs: keywords arguments passed to the convert function like `np.array`, `torch.tensor` or `tensorflow.ragged.constant`.
+            **format_kwargs (additional keyword arguments): keywords arguments passed to the convert function like `np.array`, `torch.tensor` or `tensorflow.ragged.constant`.
 
         Example:
 
@@ -963,7 +978,7 @@ class DatasetDict(dict):
                 If None, then fresh, unpredictable entropy will be pulled from the OS.
                 If an int or array_like[ints] is passed, then it will be passed to SeedSequence to derive the initial BitGenerator state.
                 You can provide one :obj:`seed` per dataset in the dataset dictionary.
-            seed (Optional `int`): A seed to initialize the default BitGenerator if ``generator=None``. Alias for seeds (the seed argument has priority over seeds if both arguments are provided).
+            seed (Optional `int`): A seed to initialize the default BitGenerator if ``generator=None``. Alias for seeds (a `ValueError` is raised if both are provided).
             generators (Optional `Dict[str, np.random.Generator]`): Numpy random Generator to use to compute the permutation of the dataset rows.
                 If ``generator=None`` (default), uses np.random.default_rng (the default BitGenerator (PCG64) of NumPy).
                 You have to provide one :obj:`generator` per dataset in the dataset dictionary.
@@ -1127,7 +1142,7 @@ class DatasetDict(dict):
             features (:class:`Features`, optional): Dataset features.
             cache_dir (str, optional, default="~/.cache/huggingface/datasets"): Directory to cache data.
             keep_in_memory (bool, default=False): Whether to copy the data in-memory.
-            **kwargs: Keyword arguments to be passed to :meth:`pandas.read_csv`.
+            **kwargs (additional keyword arguments): Keyword arguments to be passed to :meth:`pandas.read_csv`.
 
         Returns:
             :class:`DatasetDict`
@@ -1161,7 +1176,7 @@ class DatasetDict(dict):
             features (:class:`Features`, optional): Dataset features.
             cache_dir (str, optional, default="~/.cache/huggingface/datasets"): Directory to cache data.
             keep_in_memory (bool, default=False): Whether to copy the data in-memory.
-            **kwargs: Keyword arguments to be passed to :class:`JsonConfig`.
+            **kwargs (additional keyword arguments): Keyword arguments to be passed to :class:`JsonConfig`.
 
         Returns:
             :class:`DatasetDict`
@@ -1199,7 +1214,7 @@ class DatasetDict(dict):
             columns (:obj:`List[str]`, optional): If not None, only these columns will be read from the file.
                 A column name may be a prefix of a nested field, e.g. 'a' will select
                 'a.b', 'a.c', and 'a.d.e'.
-            **kwargs: Keyword arguments to be passed to :class:`ParquetConfig`.
+            **kwargs (additional keyword arguments): Keyword arguments to be passed to :class:`ParquetConfig`.
 
         Returns:
             :class:`DatasetDict`
@@ -1238,7 +1253,7 @@ class DatasetDict(dict):
             features (:class:`Features`, optional): Dataset features.
             cache_dir (str, optional, default="~/.cache/huggingface/datasets"): Directory to cache data.
             keep_in_memory (bool, default=False): Whether to copy the data in-memory.
-            **kwargs: Keyword arguments to be passed to :class:`TextConfig`.
+            **kwargs (additional keyword arguments): Keyword arguments to be passed to :class:`TextConfig`.
 
         Returns:
             :class:`DatasetDict`
@@ -1278,7 +1293,7 @@ class DatasetDict(dict):
         private: Optional[bool] = False,
         token: Optional[str] = None,
         branch: Optional[None] = None,
-        max_shard_size: Union[int, str] = "500MB",
+        max_shard_size: Optional[Union[int, str]] = None,
         shard_size: Optional[int] = "deprecated",
         embed_external_files: bool = True,
     ):
@@ -1330,15 +1345,20 @@ class DatasetDict(dict):
             max_shard_size = shard_size
 
         self._check_values_type()
+        self._check_values_features()
         total_uploaded_size = 0
         total_dataset_nbytes = 0
         info_to_dump: DatasetInfo = next(iter(self.values())).info.copy()
-        dataset_name = repo_id.split("/")[-1]
-        info_to_dump.splits = SplitDict(dataset_name=dataset_name)
+        info_to_dump.splits = SplitDict()
+
+        for split in self.keys():
+            if not re.match(_split_re, split):
+                raise ValueError(f"Split name should match '{_split_re}' but got '{split}'.")
+
         for split in self.keys():
             logger.warning(f"Pushing split {split} to the Hub.")
             # The split=key needs to be removed before merging
-            repo_id, split, uploaded_size, dataset_nbytes = self[split]._push_parquet_shards_to_hub(
+            repo_id, split, uploaded_size, dataset_nbytes, _, _ = self[split]._push_parquet_shards_to_hub(
                 repo_id,
                 split=split,
                 private=private,
@@ -1349,26 +1369,52 @@ class DatasetDict(dict):
             )
             total_uploaded_size += uploaded_size
             total_dataset_nbytes += dataset_nbytes
-            info_to_dump.splits[split] = SplitInfo(
-                str(split), num_bytes=dataset_nbytes, num_examples=len(self[split]), dataset_name=dataset_name
-            )
-        organization, dataset_name = repo_id.split("/")
+            info_to_dump.splits[split] = SplitInfo(str(split), num_bytes=dataset_nbytes, num_examples=len(self[split]))
         info_to_dump.download_checksums = None
         info_to_dump.download_size = total_uploaded_size
         info_to_dump.dataset_size = total_dataset_nbytes
         info_to_dump.size_in_bytes = total_uploaded_size + total_dataset_nbytes
-        buffer = BytesIO()
-        buffer.write(f'{{"{organization}--{dataset_name}": '.encode())
-        info_to_dump._dump_info(buffer)
-        buffer.write(b"}")
+
+        api = HfApi(endpoint=config.HF_ENDPOINT)
+        repo_files = hf_api_list_repo_files(api, repo_id, repo_type="dataset", revision=branch, use_auth_token=token)
+
+        # push to the deprecated dataset_infos.json
+        if config.DATASETDICT_INFOS_FILENAME in repo_files:
+            buffer = BytesIO()
+            buffer.write(b'{"default": ')
+            info_to_dump._dump_info(buffer, pretty_print=True)
+            buffer.write(b"}")
+            HfApi(endpoint=config.HF_ENDPOINT).upload_file(
+                path_or_fileobj=buffer.getvalue(),
+                path_in_repo=config.DATASETDICT_INFOS_FILENAME,
+                repo_id=repo_id,
+                token=token,
+                repo_type="dataset",
+                revision=branch,
+            )
+        # push to README
+        if "README.md" in repo_files:
+            download_config = DownloadConfig()
+            download_config.download_desc = "Downloading metadata"
+            download_config.use_auth_token = token
+            dataset_readme_path = cached_path(
+                hf_hub_url(repo_id, "README.md"),
+                download_config=download_config,
+            )
+            dataset_metadata = DatasetMetadata.from_readme(Path(dataset_readme_path))
+            with open(dataset_readme_path, encoding="utf-8") as readme_file:
+                readme_content = readme_file.read()
+        else:
+            dataset_metadata = DatasetMetadata()
+            readme_content = f'# Dataset Card for "{repo_id.split("/")[-1]}"\n\n[More Information needed](https://github.com/huggingface/datasets/blob/main/CONTRIBUTING.md#how-to-contribute-to-the-dataset-cards)'
+        DatasetInfosDict({"default": info_to_dump}).to_metadata(dataset_metadata)
         HfApi(endpoint=config.HF_ENDPOINT).upload_file(
-            path_or_fileobj=buffer.getvalue(),
-            path_in_repo=config.DATASETDICT_INFOS_FILENAME,
+            path_or_fileobj=dataset_metadata._to_readme(readme_content).encode(),
+            path_in_repo="README.md",
             repo_id=repo_id,
             token=token,
             repo_type="dataset",
             revision=branch,
-            identical_ok=True,
         )
 
 
@@ -1386,6 +1432,19 @@ class IterableDatasetDict(dict):
 
             type (:obj:`str`, optional, default None): if set to "torch", the returned dataset
                 will be a subclass of torch.utils.data.IterableDataset to be used in a DataLoader
+
+        Example:
+
+        ```py
+        >>> from datasets import load_dataset
+        >>> ds = load_dataset("rotten_tomatoes", streaming=True)
+        >>> from transformers import AutoTokenizer
+        >>> tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+        >>> def encode(example):
+        ...     return tokenizer(examples["text"], truncation=True, padding="max_length")
+        >>> ds = ds.map(encode, batched=True, remove_columns=["text"])
+        >>> ds = ds.with_format("torch")
+        ```
         """
         return IterableDatasetDict({k: dataset.with_format(type=type) for k, dataset in self.items()})
 
@@ -1396,6 +1455,7 @@ class IterableDatasetDict(dict):
         input_columns: Optional[Union[str, List[str]]] = None,
         batched: bool = False,
         batch_size: int = 1000,
+        drop_last_batch: bool = False,
         remove_columns: Optional[Union[str, List[str]]] = None,
     ) -> "IterableDatasetDict":
         """
@@ -1431,9 +1491,25 @@ class IterableDatasetDict(dict):
                 as positional arguments. If `None`, a dict mapping to all formatted columns is passed as one argument.
             batched (:obj:`bool`, default `False`): Provide batch of examples to `function`.
             batch_size (:obj:`int`, optional, default ``1000``): Number of examples per batch provided to `function` if `batched=True`.
+            drop_last_batch (:obj:`bool`, default `False`): Whether a last batch smaller than the batch_size should be
+                dropped instead of being processed by the function.
             remove_columns (`Optional[List[str]]`, defaults to `None`): Remove a selection of columns while doing the mapping.
                 Columns will be removed before updating the examples with the output of `function`, i.e. if `function` is adding
                 columns with names in `remove_columns`, these columns will be kept.
+
+        Example:
+
+        ```py
+        >>> from datasets import load_dataset
+        >>> ds = load_dataset("rotten_tomatoes", streaming=True)
+        >>> def add_prefix(example):
+        ...     example["text"] = "Review: " + example["text"]
+        ...     return example
+        >>> ds = ds.map(add_prefix)
+        >>> next(iter(ds["train"]))
+        {'label': 1,
+         'text': 'Review: the rock is destined to be the 21st century\'s new " conan " and that he\'s going to make a splash even greater than arnold schwarzenegger , jean-claud van damme or steven segal .'}
+        ```
         """
         return IterableDatasetDict(
             {
@@ -1443,6 +1519,7 @@ class IterableDatasetDict(dict):
                     input_columns=input_columns,
                     batched=batched,
                     batch_size=batch_size,
+                    drop_last_batch=drop_last_batch,
                     remove_columns=remove_columns,
                 )
                 for k, dataset in self.items()
@@ -1475,6 +1552,20 @@ class IterableDatasetDict(dict):
                 positional arguments. If `None`, a dict mapping to all formatted columns is passed as one argument.
             batched (:obj:`bool`, defaults to `False`): Provide batch of examples to `function`
             batch_size (:obj:`int`, optional, default ``1000``): Number of examples per batch provided to `function` if `batched=True`.
+
+        Example:
+
+        ```py
+        >>> from datasets import load_dataset
+        >>> ds = load_dataset("rotten_tomatoes", streaming=True)
+        >>> ds = ds.filter(lambda x: x["label"] == 0)
+        >>> list(ds["train"].take(3))
+        [{'label': 0, 'text': 'Review: simplistic , silly and tedious .'},
+         {'label': 0,
+         'text': "Review: it's so laddish and juvenile , only teenage boys could possibly find it funny ."},
+         {'label': 0,
+         'text': 'Review: exploitative and largely devoid of the depth or sophistication that would make watching such a graphic treatment of the crimes bearable .'}]
+        ```
         """
         return IterableDatasetDict(
             {
@@ -1515,6 +1606,27 @@ class IterableDatasetDict(dict):
             generator (:obj:`numpy.random.Generator`, optional): Numpy random Generator to use to compute the permutation of the dataset rows.
                 If ``generator=None`` (default), uses np.random.default_rng (the default BitGenerator (PCG64) of NumPy).
             buffer_size (:obj:`int`, default 1000): size of the buffer.
+
+        Example:
+
+        ```py
+        >>> from datasets import load_dataset
+        >>> ds = load_dataset("rotten_tomatoes", streaming=True)
+        >>> list(ds["train"].take(3))
+        [{'label': 1,
+         'text': 'the rock is destined to be the 21st century\'s new " conan " and that he\'s going to make a splash even greater than arnold schwarzenegger , jean-claud van damme or steven segal .'},
+         {'label': 1,
+         'text': 'the gorgeously elaborate continuation of " the lord of the rings " trilogy is so huge that a column of words cannot adequately describe co-writer/director peter jackson\'s expanded vision of j . r . r . tolkien\'s middle-earth .'},
+         {'label': 1, 'text': 'effective but too-tepid biopic'}]
+        >>> ds = ds.shuffle(seed=42)
+        >>> list(ds["train"].take(3))
+        [{'label': 1,
+         'text': "a sports movie with action that's exciting on the field and a story you care about off it ."},
+         {'label': 1,
+         'text': 'at its best , the good girl is a refreshingly adult take on adultery . . .'},
+         {'label': 1,
+         'text': "sam jones became a very lucky filmmaker the day wilco got dropped from their record label , proving that one man's ruin may be another's fortune ."}]
+        ```
         """
         return IterableDatasetDict(
             {
@@ -1535,6 +1647,17 @@ class IterableDatasetDict(dict):
 
         Returns:
             :class:`IterableDatasetDict`: A copy of the dataset with a renamed column.
+
+        Example:
+
+        ```py
+        >>> from datasets import load_dataset
+        >>> ds = load_dataset("rotten_tomatoes", streaming=True)
+        >>> ds = ds.rename_column("text", "movie_review")
+        >>> next(iter(ds["train"]))
+        {'label': 1,
+         'movie_review': 'the rock is destined to be the 21st century\'s new " conan " and that he\'s going to make a splash even greater than arnold schwarzenegger , jean-claud van damme or steven segal .'}
+        ```
         """
         return IterableDatasetDict(
             {
@@ -1554,6 +1677,17 @@ class IterableDatasetDict(dict):
 
         Returns:
             :class:`IterableDatasetDict`: A copy of the dataset with renamed columns
+
+        Example:
+
+        ```py
+        >>> from datasets import load_dataset
+        >>> ds = load_dataset("rotten_tomatoes", streaming=True)
+        >>> ds = ds.rename_columns({"text": "movie_review", "label": "rating"})
+        >>> next(iter(ds["train"]))
+        {'movie_review': 'the rock is destined to be the 21st century\'s new " conan " and that he\'s going to make a splash even greater than arnold schwarzenegger , jean-claud van damme or steven segal .',
+         'rating': 1}
+        ```
         """
         return IterableDatasetDict(
             {k: dataset.rename_columns(column_mapping=column_mapping) for k, dataset in self.items()}
@@ -1571,6 +1705,16 @@ class IterableDatasetDict(dict):
 
         Returns:
             :class:`IterableDatasetDict`: A copy of the dataset object without the columns to remove.
+
+        Example:
+
+        ```py
+        >>> from datasets import load_dataset
+        >>> ds = load_dataset("rotten_tomatoes", streaming=True)
+        >>> ds = ds.remove_columns("label")
+        >>> next(iter(ds["train"]))
+        {'text': 'the rock is destined to be the 21st century\'s new " conan " and that he\'s going to make a splash even greater than arnold schwarzenegger , jean-claud van damme or steven segal .'}
+        ```
         """
         return IterableDatasetDict({k: dataset.remove_columns(column_names) for k, dataset in self.items()})
 
@@ -1584,6 +1728,20 @@ class IterableDatasetDict(dict):
 
         Returns:
             :class:`IterableDatasetDict`
+
+        Example:
+
+        ```py
+        >>> from datasets import load_dataset
+        >>> ds = load_dataset("rotten_tomatoes", streaming=True)
+        >>> ds["train"].features
+        {'label': ClassLabel(num_classes=2, names=['neg', 'pos'], id=None),
+         'text': Value(dtype='string', id=None)}
+        >>> ds = ds.cast_column('label', ClassLabel(names=['bad', 'good']))
+        >>> ds["train"].features
+        {'label': ClassLabel(num_classes=2, names=['bad', 'good'], id=None),
+         'text': Value(dtype='string', id=None)}
+        ```
         """
         return IterableDatasetDict(
             {k: dataset.cast_column(column=column, feature=feature) for k, dataset in self.items()}
@@ -1605,5 +1763,22 @@ class IterableDatasetDict(dict):
 
         Returns:
             :class:`IterableDatasetDict`: A copy of the dataset with casted features.
+
+        Example:
+
+        ```py
+        >>> from datasets import load_dataset
+        >>> ds = load_dataset("rotten_tomatoes", streaming=True)
+        >>> ds["train"].features
+        {'label': ClassLabel(num_classes=2, names=['neg', 'pos'], id=None),
+         'text': Value(dtype='string', id=None)}
+        >>> new_features = ds["train"].features.copy()
+        >>> new_features['label'] = ClassLabel(names=['bad', 'good'])
+        >>> new_features['text'] = Value('large_string')
+        >>> ds = ds.cast(new_features)
+        >>> ds["train"].features
+        {'label': ClassLabel(num_classes=2, names=['bad', 'good'], id=None),
+         'text': Value(dtype='large_string', id=None)}
+        ```
         """
         return IterableDatasetDict({k: dataset.cast(features=features) for k, dataset in self.items()})

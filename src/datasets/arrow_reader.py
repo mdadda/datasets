@@ -26,15 +26,16 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .naming import _split_re, filename_for_dataset_split
+from .download.download_config import DownloadConfig
+from .naming import _split_re, filenames_for_dataset_split
 from .table import InMemoryTable, MemoryMappedTable, Table, concat_tables
 from .utils import logging
-from .utils.file_utils import DownloadConfig, cached_path
+from .utils.file_utils import cached_path
 
 
 if TYPE_CHECKING:
     from .info import DatasetInfo  # noqa: F401
-    from .splits import Split  # noqa: F401
+    from .splits import Split, SplitInfo  # noqa: F401
 
 
 logger = logging.get_logger(__name__)
@@ -87,7 +88,13 @@ class FileInstructions:
     file_instructions: List[dict]
 
 
-def make_file_instructions(name, split_infos, instruction, filetype_suffix=None):
+def make_file_instructions(
+    name: str,
+    split_infos: List["SplitInfo"],
+    instruction: Union[str, "ReadInstruction"],
+    filetype_suffix: Optional[str] = None,
+    prefix_path: Optional[str] = None,
+):
     """Returns instructions of the split dict.
 
     Args:
@@ -100,31 +107,48 @@ def make_file_instructions(name, split_infos, instruction, filetype_suffix=None)
         file_intructions: FileInstructions instance
     """
     name2len = {info.name: info.num_examples for info in split_infos}
+    name2shard_lengths = {info.name: info.shard_lengths for info in split_infos}
+    name2filenames = {
+        info.name: filenames_for_dataset_split(
+            path=prefix_path,
+            dataset_name=name,
+            split=info.name,
+            filetype_suffix=filetype_suffix,
+            shard_lengths=name2shard_lengths[info.name],
+        )
+        for info in split_infos
+    }
     if not isinstance(instruction, ReadInstruction):
         instruction = ReadInstruction.from_spec(instruction)
     # Create the absolute instruction (per split)
     absolute_instructions = instruction.to_absolute(name2len)
 
-    return _make_file_instructions_from_absolutes(
-        name=name, name2len=name2len, absolute_instructions=absolute_instructions, filetype_suffix=filetype_suffix
-    )
-
-
-def _make_file_instructions_from_absolutes(name, name2len, absolute_instructions, filetype_suffix=None):
-    """Returns the files instructions from the absolute instructions list."""
     # For each split, return the files instruction (skip/take)
     file_instructions = []
     num_examples = 0
     for abs_instr in absolute_instructions:
-        length = name2len[abs_instr.splitname]
-        filename = filename_for_dataset_split(
-            dataset_name=name, split=abs_instr.splitname, filetype_suffix=filetype_suffix
-        )
+        split_length = name2len[abs_instr.splitname]
+        filenames = name2filenames[abs_instr.splitname]
+        shard_lengths = name2shard_lengths[abs_instr.splitname]
         from_ = 0 if abs_instr.from_ is None else abs_instr.from_
-        to = length if abs_instr.to is None else abs_instr.to
-        num_examples += to - from_
-        single_file_instructions = [{"filename": filename, "skip": from_, "take": to - from_}]
-        file_instructions.extend(single_file_instructions)
+        to = split_length if abs_instr.to is None else abs_instr.to
+        if shard_lengths is None:  # not sharded
+            for filename in filenames:
+                num_examples += to - from_
+                file_instructions.append({"filename": filename, "skip": from_, "take": to - from_})
+        else:  # sharded
+            index_start = 0  # Beginning (included) of moving window.
+            index_end = 0  # End (excluded) of moving window.
+            for filename, shard_length in zip(filenames, shard_lengths):
+                index_end += shard_length
+                if from_ < index_end and to > index_start:  # There is something to take.
+                    skip = from_ - index_start if from_ > index_start else 0
+                    take = to - index_start - skip if to < index_end else -1
+                    if take == 0:
+                        continue
+                    file_instructions.append({"filename": filename, "skip": skip, "take": take})
+                    num_examples += shard_length - skip if take == -1 else take
+                index_start += shard_length
     return FileInstructions(
         num_examples=num_examples,
         file_instructions=file_instructions,
@@ -181,7 +205,7 @@ class BaseReader:
     def get_file_instructions(self, name, instruction, split_infos):
         """Return list of dict {'filename': str, 'skip': int, 'take': int}"""
         file_instructions = make_file_instructions(
-            name, split_infos, instruction, filetype_suffix=self._filetype_suffix
+            name, split_infos, instruction, filetype_suffix=self._filetype_suffix, prefix_path=self._path
         )
         files = file_instructions.file_instructions
         return files
@@ -210,7 +234,7 @@ class BaseReader:
         files = self.get_file_instructions(name, instructions, split_infos)
         if not files:
             msg = f'Instruction "{instructions}" corresponds to no data!'
-            raise AssertionError(msg)
+            raise ValueError(msg)
         return self.read_files(files=files, original_instructions=instructions, in_memory=in_memory)
 
     def read_files(
@@ -303,6 +327,8 @@ class ArrowReader(BaseReader):
             filename_skip_take["take"] if "take" in filename_skip_take else None,
         )
         table = ArrowReader.read_table(filename, in_memory=in_memory)
+        if take == -1:
+            take = len(table) - skip
         # here we don't want to slice an empty table, or it may segfault
         if skip is not None and take is not None and not (skip == 0 and take == len(table)):
             table = table.slice(skip, take)
@@ -380,11 +406,11 @@ class _RelativeInstruction:
         if self.rounding is not None and self.rounding not in ["closest", "pct1_dropremainder"]:
             raise ValueError("rounding must be either closest or pct1_dropremainder")
         if self.unit != "%" and self.rounding is not None:
-            raise AssertionError("It is forbidden to specify rounding if not using percent slicing.")
+            raise ValueError("It is forbidden to specify rounding if not using percent slicing.")
         if self.unit == "%" and self.from_ is not None and abs(self.from_) > 100:
-            raise AssertionError("Percent slice boundaries must be > -100 and < 100.")
+            raise ValueError("Percent slice boundaries must be > -100 and < 100.")
         if self.unit == "%" and self.to is not None and abs(self.to) > 100:
-            raise AssertionError("Percent slice boundaries must be > -100 and < 100.")
+            raise ValueError("Percent slice boundaries must be > -100 and < 100.")
         # Update via __dict__ due to instance being "frozen"
         self.__dict__["rounding"] = "closest" if self.rounding is None and self.unit == "%" else self.rounding
 
@@ -393,7 +419,7 @@ def _str_to_read_instruction(spec):
     """Returns ReadInstruction for given string."""
     res = _SUB_SPEC_RE.match(spec)
     if not res:
-        raise AssertionError(f"Unrecognized instruction format: {spec}")
+        raise ValueError(f"Unrecognized instruction format: {spec}")
     unit = "%" if res.group("from_pct") or res.group("to_pct") else "abs"
     return ReadInstruction(
         split_name=res.group("split"),
@@ -411,7 +437,7 @@ def _pct_to_abs_pct1(boundary, num_examples):
             'Using "pct1_dropremainder" rounding on a split with less than 100 '
             "elements is forbidden: it always results in an empty dataset."
         )
-        raise AssertionError(msg)
+        raise ValueError(msg)
     return boundary * math.trunc(num_examples / 100.0)
 
 
@@ -441,7 +467,7 @@ def _rel_to_abs_instr(rel_instr, name2len):
         to = num_examples if to is None else to
     if abs(from_) > num_examples or abs(to) > num_examples:
         msg = f'Requested slice [{from_ or ""}:{to or ""}] incompatible with {num_examples} examples.'
-        raise AssertionError(msg)
+        raise ValueError(msg)
     if from_ < 0:
         from_ = num_examples + from_
     elif from_ == 0:
@@ -556,7 +582,7 @@ class ReadInstruction:
         spec = str(spec)  # Need to convert to str in case of NamedSplit instance.
         subs = _ADDITION_SEP_RE.split(spec)
         if not subs:
-            raise AssertionError(f"No instructions could be built out of {spec}")
+            raise ValueError(f"No instructions could be built out of {spec}")
         instruction = _str_to_read_instruction(subs[0])
         return sum((_str_to_read_instruction(sub) for sub in subs[1:]), instruction)
 
@@ -584,7 +610,7 @@ class ReadInstruction:
         """Returns a new ReadInstruction obj, result of appending other to self."""
         if not isinstance(other, ReadInstruction):
             msg = "ReadInstruction can only be added to another ReadInstruction obj."
-            raise AssertionError(msg)
+            raise TypeError(msg)
         self_ris = self._relative_instructions
         other_ris = other._relative_instructions  # pylint: disable=protected-access
         if (
@@ -592,7 +618,7 @@ class ReadInstruction:
             and other_ris[0].unit != "abs"
             and self._relative_instructions[0].rounding != other_ris[0].rounding
         ):
-            raise AssertionError("It is forbidden to sum ReadInstruction instances with different rounding values.")
+            raise ValueError("It is forbidden to sum ReadInstruction instances with different rounding values.")
         return self._read_instruction_from_relative_instructions(self_ris + other_ris)
 
     def __str__(self):

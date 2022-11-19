@@ -1,4 +1,5 @@
 import enum
+import inspect
 import warnings
 from functools import wraps
 from typing import Callable, Optional
@@ -11,21 +12,27 @@ logger = get_logger(__name__)
 
 
 def deprecated(help_message: Optional[str] = None):
-    """Decorator to mark a function as deprecated.
+    """Decorator to mark a class or a function as deprecated.
 
     Args:
         help_message (:obj:`str`, optional): An optional message to guide the user on how to
             switch to non-deprecated usage of the library.
     """
 
-    def decorator(deprecated_function: Callable):
+    def decorator(deprecated_class_or_function: Callable):
         global _emitted_deprecation_warnings
+
+        if inspect.isclass(deprecated_class_or_function):
+            deprecated_function = deprecated_class_or_function.__init__
+            name = deprecated_class_or_function.__name__
+        else:
+            deprecated_function = deprecated_class_or_function
+            name = deprecated_function.__name__
+            # Support deprecating __init__ class method: class name instead
+            name = name if name != "__init__" else deprecated_function.__qualname__.split(".")[-2]
+
         warning_msg = (
-            (
-                f"{deprecated_function.__name__} is deprecated and will be removed "
-                "in the next major version of datasets."
-            )
-            + f" {help_message}"
+            f"{name} is deprecated and will be removed in the next major version of datasets." + f" {help_message}"
             if help_message
             else ""
         )
@@ -39,7 +46,12 @@ def deprecated(help_message: Optional[str] = None):
             return deprecated_function(*args, **kwargs)
 
         wrapper._decorator_name_ = "deprecated"
-        return wrapper
+
+        if inspect.isclass(deprecated_class_or_function):
+            deprecated_class_or_function.__init__ = wrapper
+            return deprecated_class_or_function
+        else:
+            return wrapper
 
     return decorator
 

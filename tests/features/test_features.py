@@ -1,4 +1,4 @@
-from dataclasses import asdict
+import datetime
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -7,8 +7,9 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
+from datasets import Array2D
 from datasets.arrow_dataset import Dataset
-from datasets.features import ClassLabel, Features, Image, Sequence, Value
+from datasets.features import Audio, ClassLabel, Features, Image, Sequence, Value
 from datasets.features.features import (
     _arrow_to_datasets_dtype,
     _cast_to_python_objects,
@@ -19,6 +20,7 @@ from datasets.features.features import (
 )
 from datasets.features.translation import Translation, TranslationVariableLanguages
 from datasets.info import DatasetInfo
+from datasets.utils.py_utils import asdict
 
 from ..utils import require_jax, require_tf, require_torch
 
@@ -58,6 +60,7 @@ class FeaturesTest(TestCase):
             pa.string(),
             pa.int32(),
             pa.float64(),
+            pa.array([datetime.time(1, 1, 1)]).type,  # arrow type: DataType(time64[us])
         ]
         for dt in supported_pyarrow_datatypes:
             self.assertEqual(dt, string_to_arrow(_arrow_to_datasets_dtype(dt)))
@@ -95,6 +98,13 @@ class FeaturesTest(TestCase):
     def test_feature_named_type(self):
         """reference: issue #1110"""
         features = Features({"_type": Value("string")})
+        ds_info = DatasetInfo(features=features)
+        reloaded_features = Features.from_dict(asdict(ds_info)["features"])
+        assert features == reloaded_features
+
+    def test_class_label_feature_with_no_labels(self):
+        """reference: issue #4681"""
+        features = Features({"label": ClassLabel(names=[])})
         ds_info = DatasetInfo(features=features)
         reloaded_features = Features.from_dict(asdict(ds_info)["features"])
         assert features == reloaded_features
@@ -284,10 +294,12 @@ def test_classlabel_str2int():
     classlabel = ClassLabel(names=names)
     for label in names:
         assert classlabel.str2int(label) == names.index(label)
-    with pytest.raises(KeyError):
+    with pytest.raises(ValueError):
         classlabel.str2int("__bad_label_name__")
     with pytest.raises(ValueError):
         classlabel.str2int(1)
+    with pytest.raises(ValueError):
+        classlabel.str2int(None)
 
 
 def test_classlabel_int2str():
@@ -297,6 +309,45 @@ def test_classlabel_int2str():
         assert classlabel.int2str(i) == names[i]
     with pytest.raises(ValueError):
         classlabel.int2str(len(names))
+    with pytest.raises(ValueError):
+        classlabel.int2str(-1)
+    with pytest.raises(ValueError):
+        classlabel.int2str(None)
+
+
+def test_classlabel_cast_storage():
+    names = ["negative", "positive"]
+    classlabel = ClassLabel(names=names)
+    # from integers
+    arr = pa.array([0, 1, -1, -100], type=pa.int64())
+    result = classlabel.cast_storage(arr)
+    assert result.type == pa.int64()
+    assert result.to_pylist() == [0, 1, -1, -100]
+    arr = pa.array([0, 1, -1, -100], type=pa.int32())
+    result = classlabel.cast_storage(arr)
+    assert result.type == pa.int64()
+    assert result.to_pylist() == [0, 1, -1, -100]
+    arr = pa.array([3])
+    with pytest.raises(ValueError):
+        classlabel.cast_storage(arr)
+    # from strings
+    arr = pa.array(["negative", "positive"])
+    result = classlabel.cast_storage(arr)
+    assert result.type == pa.int64()
+    assert result.to_pylist() == [0, 1]
+    arr = pa.array(["__label_that_doesnt_exist__"])
+    with pytest.raises(ValueError):
+        classlabel.cast_storage(arr)
+    # from nulls
+    arr = pa.array([None])
+    result = classlabel.cast_storage(arr)
+    assert result.type == pa.int64()
+    assert result.to_pylist() == [None]
+    # from empty
+    arr = pa.array([])
+    result = classlabel.cast_storage(arr)
+    assert result.type == pa.int64()
+    assert result.to_pylist() == []
 
 
 @pytest.mark.parametrize("class_label_arg", ["names", "names_file"])
@@ -413,7 +464,7 @@ class CastToPythonObjectsTest(TestCase):
 
     def test_cast_to_python_objects_tuple(self):
         obj = {"col_1": [{"vec": (1, 2, 3), "txt": "foo"}] * 3, "col_2": [(1, 2), (3, 4), (5, 6)]}
-        expected_obj = {"col_1": [{"vec": [1, 2, 3], "txt": "foo"}] * 3, "col_2": [[1, 2], [3, 4], [5, 6]]}
+        expected_obj = {"col_1": [{"vec": (1, 2, 3), "txt": "foo"}] * 3, "col_2": [(1, 2), (3, 4), (5, 6)]}
         casted_obj = cast_to_python_objects(obj)
         self.assertDictEqual(casted_obj, expected_obj)
 
@@ -440,6 +491,26 @@ class CastToPythonObjectsTest(TestCase):
         expected_obj = {"col_1": [{"vec": [1, 2, 3], "txt": "foo"}] * 3, "col_2": [[1, 2], [3, 4], [5, 6]]}
         casted_obj = cast_to_python_objects(obj)
         self.assertDictEqual(casted_obj, expected_obj)
+
+    def test_cast_to_python_objects_pandas_timestamp(self):
+        obj = pd.Timestamp(2020, 1, 1)
+        expected_obj = obj.to_pydatetime()
+        casted_obj = cast_to_python_objects(obj)
+        self.assertEqual(casted_obj, expected_obj)
+        casted_obj = cast_to_python_objects(pd.Series([obj]))
+        self.assertListEqual(casted_obj, [expected_obj])
+        casted_obj = cast_to_python_objects(pd.DataFrame({"a": [obj]}))
+        self.assertDictEqual(casted_obj, {"a": [expected_obj]})
+
+    def test_cast_to_python_objects_pandas_timedelta(self):
+        obj = pd.Timedelta(seconds=1)
+        expected_obj = obj.to_pytimedelta()
+        casted_obj = cast_to_python_objects(obj)
+        self.assertEqual(casted_obj, expected_obj)
+        casted_obj = cast_to_python_objects(pd.Series([obj]))
+        self.assertListEqual(casted_obj, [expected_obj])
+        casted_obj = cast_to_python_objects(pd.DataFrame({"a": [obj]}))
+        self.assertDictEqual(casted_obj, {"a": [expected_obj]})
 
     @require_torch
     def test_cast_to_python_objects_torch(self):
@@ -492,3 +563,65 @@ class CastToPythonObjectsTest(TestCase):
         obj = {"col_1": [[1, 2], [3, 4], [5, 6]]}
         cast_to_python_objects(obj)
         self.assertEqual(mocked_cast.call_count, 4)  # 4 = depth of obj
+
+
+SIMPLE_FEATURES = [
+    Features(),
+    Features({"a": Value("int32")}),
+    Features({"a": Value("int32", id="my feature")}),
+    Features({"a": Value("int32"), "b": Value("float64"), "c": Value("string")}),
+]
+
+CUSTOM_FEATURES = [
+    Features({"label": ClassLabel(names=["negative", "positive"])}),
+    Features({"array": Array2D(dtype="float32", shape=(4, 4))}),
+    Features({"image": Image()}),
+    Features({"audio": Audio()}),
+    Features({"image": Image(decode=False)}),
+    Features({"audio": Audio(decode=False)}),
+    Features({"translation": Translation(["en", "fr"])}),
+    Features({"translation": TranslationVariableLanguages(["en", "fr"])}),
+]
+
+NESTED_FEATURES = [
+    Features({"foo": {}}),
+    Features({"foo": {"bar": Value("int32")}}),
+    Features({"foo": {"bar1": Value("int32"), "bar2": Value("float64")}}),
+    Features({"foo": Sequence(Value("int32"))}),
+    Features({"foo": Sequence({})}),
+    Features({"foo": Sequence({"bar": Value("int32")})}),
+    Features({"foo": [Value("int32")]}),
+    Features({"foo": [{"bar": Value("int32")}]}),
+]
+
+NESTED_CUSTOM_FEATURES = [
+    Features({"foo": {"bar": ClassLabel(names=["negative", "positive"])}}),
+    Features({"foo": Sequence(ClassLabel(names=["negative", "positive"]))}),
+    Features({"foo": Sequence({"bar": ClassLabel(names=["negative", "positive"])})}),
+    Features({"foo": [ClassLabel(names=["negative", "positive"])]}),
+    Features({"foo": [{"bar": ClassLabel(names=["negative", "positive"])}]}),
+]
+
+
+@pytest.mark.parametrize("features", SIMPLE_FEATURES + CUSTOM_FEATURES + NESTED_FEATURES + NESTED_CUSTOM_FEATURES)
+def test_features_to_dict(features: Features):
+    features_dict = features.to_dict()
+    assert isinstance(features_dict, dict)
+    reloaded = Features.from_dict(features_dict)
+    assert features == reloaded
+
+
+@pytest.mark.parametrize("features", SIMPLE_FEATURES + CUSTOM_FEATURES + NESTED_FEATURES + NESTED_CUSTOM_FEATURES)
+def test_features_to_yaml_list(features: Features):
+    features_yaml_list = features._to_yaml_list()
+    assert isinstance(features_yaml_list, list)
+    reloaded = Features._from_yaml_list(features_yaml_list)
+    assert features == reloaded
+
+
+@pytest.mark.parametrize("features", SIMPLE_FEATURES + CUSTOM_FEATURES + NESTED_FEATURES + NESTED_CUSTOM_FEATURES)
+def test_features_to_arrow_schema(features: Features):
+    arrow_schema = features.arrow_schema
+    assert isinstance(arrow_schema, pa.Schema)
+    reloaded = Features.from_arrow_schema(arrow_schema)
+    assert features == reloaded

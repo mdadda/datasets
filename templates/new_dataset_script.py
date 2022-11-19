@@ -54,7 +54,7 @@ _URLS = {
 }
 
 
-# TODO: Name of the dataset usually match the script name with CamelCase instead of snake_case
+# TODO: Name of the dataset usually matches the script name with CamelCase instead of snake_case
 class NewDataset(datasets.GeneratorBasedBuilder):
     """TODO: Short description of my dataset."""
 
@@ -133,19 +133,19 @@ class NewDataset(datasets.GeneratorBasedBuilder):
                 },
             ),
             datasets.SplitGenerator(
-                name=datasets.Split.TEST,
-                # These kwargs will be passed to _generate_examples
-                gen_kwargs={
-                    "filepath": os.path.join(data_dir, "test.jsonl"),
-                    "split": "test"
-                },
-            ),
-            datasets.SplitGenerator(
                 name=datasets.Split.VALIDATION,
                 # These kwargs will be passed to _generate_examples
                 gen_kwargs={
                     "filepath": os.path.join(data_dir, "dev.jsonl"),
                     "split": "dev",
+                },
+            ),
+            datasets.SplitGenerator(
+                name=datasets.Split.TEST,
+                # These kwargs will be passed to _generate_examples
+                gen_kwargs={
+                    "filepath": os.path.join(data_dir, "test.jsonl"),
+                    "split": "test"
                 },
             ),
         ]

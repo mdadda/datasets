@@ -32,7 +32,7 @@ When loading a dataset from the Hub:
 - If there's no dataset script, all the files in the supported formats are loaded.
 - If there's a dataset script, it is downloaded and executed to download and prepare the dataset.
 
-For more information on how to load a dataset from the Hub, see how to load from the [load-from-the-hub](#load-from-the-hub).
+For more information on how to load a dataset from the Hub, take a look at the [load a dataset from the Hub](./load_hub) tutorial.
 
 ### Create the repository
 
@@ -81,8 +81,6 @@ Here the `namespace` is either your username or your organization name.
 
 - `your_dataset_name.py` is your dataset loading script (optional if your data files are already in the supported formats csv/jsonl/json/parquet/txt). To create a dataset script, see the [dataset script](dataset_script) page.
 
-- `dataset_infos.json` contains metadata about the dataset (required only if you have a dataset script, or if you want to specify custom feature types).
-
 ### Upload your files
 
 You can directly upload your files from your repository on the Hugging Face Hub, but this guide will show you how to upload the files from the terminal.
@@ -97,10 +95,10 @@ git add *.json
 git commit -m "add json files"
 ```
 
-6. Add the dataset loading script and metadata file:
+6. Add the dataset loading script and dataset card:
 
 ```
-cp /somewhere/data/dataset_infos.json .
+cp /somewhere/data/README.md .
 cp /somewhere/data/load_script.py .
 git add --all
 ```
@@ -119,25 +117,41 @@ Congratulations, your dataset has now been uploaded to the Hugging Face Hub wher
 dataset = load_dataset("namespace/your_dataset_name")
 ```
 
+### Ask for a help and reviews
+
+If you need help with a dataset script, feel free to check the [datasets forum](https://discuss.huggingface.co/c/datasets/10): it's possible that someone had similar issues and shared how they managed to fix them.
+
+Then if your script is ready and if you wish your dataset script to be reviewed by the Hugging Face team, you can open a discussion in the Community tab of your dataset with this message:
+
+```
+# Dataset rewiew request for <Dataset name>
+
+## Description
+
+<brief description of the dataset>
+
+## Files to review
+
+- file1
+- file2
+- ...
+
+cc @lhoestq @polinaeterna @mariosasko @albertvillanova
+```
+
+Members of the Hugging Face team will be happy to review your dataset script and give you advice.
+
 ## Datasets on GitHub (legacy)
 
 Datasets used to be hosted on our GitHub repository, but all datasets have now been migrated to the Hugging Face Hub.
-The legacy GitHub datasets were added originally on our GitHub repository and therefore don't have a namespace: "squad", "glue", etc. unlike the other datasets that are named "username/dataset_name" or "org/dataset_name".
-Those datasets are still maintained, and if you'd like to edit them, please open a Pull Request on the huggingface/datasets repository.
-Sharing your dataset to the Hub is the recommended way of adding a dataset.
+
+The legacy GitHub datasets were added originally on our GitHub repository and therefore don't have a namespace on the Hub: "squad", "glue", etc. unlike the other datasets that are named "username/dataset_name" or "org/dataset_name".
 
 <Tip>
 
-The distinction between a Hub dataset and a dataset from GitHub only comes from the legacy sharing workflow. It does not involve any ranking, decisioning, or opinion regarding the contents of the dataset itself.
+The distinction between a Hub dataset within or without a namespace only comes from the legacy sharing workflow. It does not involve any ranking, decisioning, or opinion regarding the contents of the dataset itself.
 
 </Tip>
 
-The code of these datasets are reviewed by the Hugging Face team, and they require test data in order to be regularly tested.
-
-In some cases it makes more sense to open a PR on GitHub:
-
-- when you need the dataset to be reviewed
-- when you need long-term maintenance from the Hugging Face team
-- when there's no clear org name / namespace that you can put the dataset under
-
-For more info, please take a look at the documentation on [How to add a new dataset in the huggingface/datasets repository](https://github.com/huggingface/datasets/blob/master/ADD_NEW_DATASET.md).
+Those datasets are mow maintained on the Hub: if you think a fix is needed, please use their "Community" tab to open a discussion or create a Pull Request.
+The code of these datasets is reviewed by the Hugging Face team.

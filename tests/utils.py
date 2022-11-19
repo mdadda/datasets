@@ -7,11 +7,13 @@ from copy import deepcopy
 from ctypes.util import find_library
 from distutils.util import strtobool
 from enum import Enum
+from importlib import import_module
 from importlib.util import find_spec
 from pathlib import Path
 from unittest.mock import patch
 
 import pyarrow as pa
+import pytest
 from packaging import version
 
 from datasets import config
@@ -38,17 +40,46 @@ _run_remote_tests = parse_flag_from_env("RUN_REMOTE", default=False)
 _run_local_tests = parse_flag_from_env("RUN_LOCAL", default=True)
 _run_packaged_tests = parse_flag_from_env("RUN_PACKAGED", default=True)
 
+# Compression
+require_lz4 = pytest.mark.skipif(not config.LZ4_AVAILABLE, reason="test requires lz4")
+require_py7zr = pytest.mark.skipif(not config.PY7ZR_AVAILABLE, reason="test requires py7zr")
+require_zstandard = pytest.mark.skipif(not config.ZSTANDARD_AVAILABLE, reason="test requires zstandard")
 
-def require_beam(test_case):
-    """
-    Decorator marking a test that requires Apache Beam.
+# Audio
+require_sndfile = pytest.mark.skipif(
+    # On Windows and OS X, soundfile installs sndfile
+    (sys.platform != "linux" and find_spec("soundfile") is None)
+    # On Linux, soundfile throws RuntimeError if sndfile OS dependency not installed with distribution package manager
+    or (sys.platform == "linux" and find_library("sndfile") is None),
+    reason="test requires sndfile: 'pip install soundfile'; "
+    "on Linux, test requires sndfile OS dependency: 'sudo apt-get install libsndfile1'",
+)
+require_libsndfile_with_opus = pytest.mark.skipif(
+    version.parse(import_module("soundfile").__libsndfile_version__) < version.parse("1.0.30")
+    if (sys.platform != "linux" and find_spec("soundfile")) or (sys.platform == "linux" and find_library("sndfile"))
+    else True,
+    reason="test requires libsndfile>=1.0.30: 'conda install -c conda-forge libsndfile>=1.0.30'",
+)
+require_sox = pytest.mark.skipif(
+    find_library("sox") is None,
+    reason="test requires sox OS dependency; only available on non-Windows: 'sudo apt-get install sox'",
+)
+require_torchaudio = pytest.mark.skipif(
+    find_spec("torchaudio") is None
+    or version.parse(import_module("torchaudio").__version__) >= version.parse("0.12.0"),
+    reason="test requires torchaudio<0.12",
+)
+require_torchaudio_latest = pytest.mark.skipif(
+    find_spec("torchaudio") is None
+    or version.parse(import_module("torchaudio").__version__) < version.parse("0.12.0"),
+    reason="test requires torchaudio>=0.12",
+)
 
-    These tests are skipped when Apache Beam isn't installed.
-
-    """
-    if not config.TORCH_AVAILABLE:
-        test_case = unittest.skip("test requires PyTorch")(test_case)
-    return test_case
+# Beam
+require_beam = pytest.mark.skipif(
+    not config.BEAM_AVAILABLE or config.DILL_VERSION >= version.parse("0.3.2"),
+    reason="test requires apache-beam and a compatible dill version",
+)
 
 
 def require_faiss(test_case):
@@ -90,6 +121,20 @@ def require_elasticsearch(test_case):
         import elasticsearch  # noqa
     except ImportError:
         test_case = unittest.skip("test requires elasticsearch")(test_case)
+    return test_case
+
+
+def require_sqlalchemy(test_case):
+    """
+    Decorator marking a test that requires SQLAlchemy.
+
+    These tests are skipped when SQLAlchemy isn't installed.
+
+    """
+    try:
+        import sqlalchemy  # noqa
+    except ImportError:
+        test_case = unittest.skip("test requires sqlalchemy")(test_case)
     return test_case
 
 
@@ -141,93 +186,6 @@ def require_pil(test_case):
     return test_case
 
 
-def require_sndfile(test_case):
-    """
-    Decorator marking a test that requires soundfile.
-
-    These tests are skipped when soundfile isn't installed.
-
-    """
-    if (sys.platform != "linux" and find_spec("soundfile") is None) or (
-        sys.platform == "linux" and find_library("sndfile") is None
-    ):
-        test_case = unittest.skip(
-            "test requires 'sndfile': `pip install soundfile`; "
-            "Linux requires sndfile installed with distribution package manager, e.g.: `sudo apt-get install libsndfile1`",
-        )(test_case)
-    return test_case
-
-
-def require_libsndfile_with_opus(test_case):
-    """
-    Decorator marking a test that requires libsndfile>=1.0.30 (version that is required for opus decoding).
-
-    These tests are skipped when libsndfile is <1.0.30.
-
-    """
-    if (sys.platform != "linux" and find_spec("soundfile")) or (sys.platform == "linux" and find_library("sndfile")):
-        import soundfile
-
-        # soundfile library is needed to be installed to check libsndfile version
-
-        if version.parse(soundfile.__libsndfile_version__) < version.parse("1.0.30"):
-            test_case = unittest.skip(
-                "test requires libsndfile>=1.0.30: `conda install -c conda-forge libsndfile>=1.0.30`"
-            )(test_case)
-    else:
-        test_case = require_sndfile(test_case)
-
-    return test_case
-
-
-def require_sox(test_case):
-    """
-    Decorator marking a test that requires sox.
-
-    These tests are skipped when sox isn't installed.
-    """
-    if find_library("sox") is None:
-        return unittest.skip("test requires 'sox'; only available in non-Windows, e.g.: `sudo apt-get install sox`")(
-            test_case
-        )
-    return test_case
-
-
-def require_torchaudio(test_case):
-    """
-    Decorator marking a test that requires torchaudio.
-
-    These tests are skipped when torchaudio isn't installed.
-    """
-    if find_spec("sox") is None:
-        return unittest.skip("test requires 'torchaudio'")(test_case)
-    return test_case
-
-
-def require_zstandard(test_case):
-    """
-    Decorator marking a test that requires zstandard.
-
-    These tests are skipped when zstandard isn't installed.
-
-    """
-    if not config.ZSTANDARD_AVAILABLE:
-        test_case = unittest.skip("test requires zstandard")(test_case)
-    return test_case
-
-
-def require_lz4(test_case):
-    """
-    Decorator marking a test that requires lz4.
-
-    These tests are skipped when lz4 isn't installed.
-
-    """
-    if not config.LZ4_AVAILABLE:
-        test_case = unittest.skip("test requires lz4")(test_case)
-    return test_case
-
-
 def require_transformers(test_case):
     """
     Decorator marking a test that requires transformers.
@@ -257,6 +215,43 @@ def require_s3(test_case):
         return unittest.skip("test requires s3fs and moto")(test_case)
     else:
         return test_case
+
+
+def require_spacy(test_case):
+    """
+    Decorator marking a test that requires spacy.
+
+    These tests are skipped when they aren't installed.
+
+    """
+    try:
+        import spacy  # noqa F401
+    except ImportError:
+        return unittest.skip("test requires spacy")(test_case)
+    else:
+        return test_case
+
+
+def require_spacy_model(model):
+    """
+    Decorator marking a test that requires a spacy model.
+
+    These tests are skipped when they aren't installed.
+    """
+
+    def _require_spacy_model(test_case):
+        try:
+            import spacy  # noqa F401
+
+            spacy.load(model)
+        except ImportError:
+            return unittest.skip("test requires spacy")(test_case)
+        except OSError:
+            return unittest.skip("test requires spacy model '{}'".format(model))(test_case)
+        else:
+            return test_case
+
+    return _require_spacy_model
 
 
 def slow(test_case):
@@ -417,3 +412,18 @@ def assert_arrow_memory_doesnt_increase():
 
 def is_rng_equal(rng1, rng2):
     return deepcopy(rng1).integers(0, 100, 10).tolist() == deepcopy(rng2).integers(0, 100, 10).tolist()
+
+
+def xfail_if_500_502_http_error(func):
+    import decorator
+    from requests.exceptions import HTTPError
+
+    def _wrapper(func, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except HTTPError as err:
+            if str(err).startswith("500") or str(err).startswith("502"):
+                pytest.xfail(str(err))
+            raise err
+
+    return decorator.decorator(_wrapper, func)
